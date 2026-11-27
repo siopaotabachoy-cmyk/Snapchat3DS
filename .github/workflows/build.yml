@@ -1,0 +1,110 @@
+name: Build Snap3DS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkitarm:latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build
+        run: make
+
+      - name: Get CIA tools
+        run: |
+          apt-get update
+          apt-get install -y wget unzip python3
+          wget -q https://github.com/3DSGuy/Project_CTR/releases/download/makerom-v0.18/makerom-v0.18-ubuntu_x86_64.zip
+          wget -q https://github.com/diasurgical/bannertool/releases/download/1.2.0/bannertool.zip
+          unzip -o makerom-v0.18-ubuntu_x86_64.zip makerom -d tools
+          unzip -o -j bannertool.zip linux-x86_64/bannertool -d tools
+          chmod +x tools/makerom tools/bannertool
+
+      - name: Make HOME Menu banner
+        run: |
+          python3 - <<'PY'
+          import struct, wave, zlib
+          rows = b""
+          for y in range(128):
+              rows += b"\x00"
+              for x in range(256):
+                  d = (x - 128) ** 2 + (y - 64) ** 2
+                  c = (21, 21, 28) if 900 < d < 2300 or d < 250 else (255, 214, 10)
+                  rows += bytes(c + (255,))
+          def chunk(t, b):
+              return struct.pack(">I", len(b)) + t + b + struct.pack(">I", zlib.crc32(t + b))
+          with open("banner.png", "wb") as f:
+              f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 256, 128, 8, 6, 0, 0, 0))
+                      + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+          with wave.open("silent.wav", "wb") as w:
+              w.setnchannels(2)
+              w.setsampwidth(2)
+              w.setframerate(44100)
+              w.writeframes(bytes(44100 * 4))
+          PY
+
+      - name: Make .cia
+        run: |
+          tools/bannertool makebanner -i banner.png -a silent.wav -o banner.bnr
+          "$DEVKITARM/bin/arm-none-eabi-strip" -o stripped.elf Snap3DS.elf
+          tools/makerom -f cia -target t -exefslogo -o Snap3DS.cia -elf stripped.elf \
+            -rsf Snap3DS.rsf -banner banner.bnr -icon Snap3DS.smdh
+
+      - name: Upload .cia
+        uses: actions/upload-artifact@v7
+        with:
+          name: Snap3DS
+          path: Snap3DS.cia
+          if-no-files-found: error
+
+  qr:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: Snap3DS
+
+      - name: Make QR code
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qrencode
+          URL="https://github.com/$GITHUB_REPOSITORY/releases/latest/download/Snap3DS.cia"
+          qrencode -s 8 -m 4 -o qr.png "$URL"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="build-$GITHUB_RUN_NUMBER"
+          IMG="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/qr.png"
+          printf 'Scan with FBI: Remote Install, then Scan QR Code\n\n![QR](%s)\n' "$IMG" > notes.md
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" Snap3DS.cia qr.png --clobber
+          else
+            gh release create "$TAG" Snap3DS.cia qr.png --target "$GITHUB_SHA" \
+              --title "Snap3DS build $GITHUB_RUN_NUMBER" --notes-file notes.md --latest
+          fi
+
+      - name: Show QR code in README
+        run: |
+          IMG="https://github.com/$GITHUB_REPOSITORY/releases/latest/download/qr.png"
+          if ! grep -qF "$IMG" README.md 2>/dev/null; then
+            printf '\n## Install with QR code\nIn FBI: Remote Install, then Scan QR Code.\n\n![QR code](%s)\n' "$IMG" >> README.md
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add README.md
+            git commit -m "Add install QR code to README"
+            git pull --rebase origin "$GITHUB_REF_NAME"
+            git push origin "HEAD:$GITHUB_REF_NAME"
+          fi
